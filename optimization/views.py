@@ -1,9 +1,10 @@
 # vrp/views.py
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
+from django.utils import timezone
 import json
-import requests
 from optimization.service.api_service import obtener_ordenes, obtener_vehiculos
+from optimization.models import ACORouteResult
 
 from optimization.service.aco_vrp import ACOVRPPD_MultiVehicle
 
@@ -204,6 +205,26 @@ def run_aco(request):
                 
                 result['routes'].append(route_info)
             
+            #11 Guardar el resultado en la base de datos
+            try:
+                ACORouteResult.objects.create(
+                    executed_at=timezone.now(),
+                    best_distance=best_distance,
+                    parameters={
+                        'num_ants': num_ants,
+                        'iterations': iterations,
+                        'evaporation_rate': evaporation_rate,
+                        'alpha': alpha,
+                        'beta': beta,
+                        'max_distance': max_distance,
+                    },
+                    routes=result['routes'],
+                    success=True
+                )
+            except Exception as e:
+                # Si ocurre un error al guardar, lo registramos pero no interrumpimos la respuesta
+                print(f"Error al guardar el resultado en la BD: {e}")
+
             return JsonResponse(result, safe=False)
         
         except json.JSONDecodeError:
@@ -226,7 +247,39 @@ def run_aco(request):
         return JsonResponse({
             'success': False,
             'error': 'Método no permitido. Use POST.'
-        }, status=405)  
+        }, status=405)
+    
+
+def get_last_route(request):
+    
+    try:
+        last_result = ACORouteResult.objects.order_by('-executed_at').first()
+        
+        if not last_result:
+            return JsonResponse({
+                'success': False,
+                'error': 'No hay rutas registradas aún.'
+            }, status=404)
+
+        data = {
+            'success': True,
+            'id': last_result.id,
+            'executed_at': last_result.executed_at,
+            'best_distance': last_result.best_distance,
+            'parameters': last_result.parameters,
+            'routes': last_result.routes
+        }
+
+        return JsonResponse(data, safe=False, status=200)
+
+    except Exception as e:
+        return JsonResponse({
+            'success': False,
+            'error': str(e)
+        }, status=500)
+    
+
+
     
 
 
