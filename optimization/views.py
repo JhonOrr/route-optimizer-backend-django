@@ -3,6 +3,8 @@ from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 import json
 import requests
+from optimization.service.api_service import obtener_ordenes, obtener_vehiculos
+
 from optimization.service.aco_vrp import ACOVRPPD_MultiVehicle
 
 @csrf_exempt
@@ -27,25 +29,15 @@ def run_aco(request):
             
             # 3. Consumir API de órdenes
             try:
-                orders_response = requests.get('http://localhost:8080/api/orders', timeout=10)
-                orders_response.raise_for_status()
-                orders_data = orders_response.json()
-            except requests.RequestException as e:
-                return JsonResponse({
-                    'success': False,
-                    'error': f'Error al consumir API de órdenes: {str(e)}'
-                }, status=500)
+                orders_data = obtener_ordenes()
+            except Exception as e:
+                return JsonResponse({'success': False, 'error': str(e)}, status=500)
             
             # 4. Consumir API de vehículos
             try:
-                vehicles_response = requests.get('http://localhost:8080/api/vehicles', timeout=10)
-                vehicles_response.raise_for_status()
-                vehicles_data = vehicles_response.json()
-            except requests.RequestException as e:
-                return JsonResponse({
-                    'success': False,
-                    'error': f'Error al consumir API de vehículos: {str(e)}'
-                }, status=500)
+                vehicles_data = obtener_vehiculos()
+            except Exception as e:
+                return JsonResponse({'success': False, 'error': str(e)}, status=500)
             
             # 5. Validar que existan datos
             if not vehicles_data or len(vehicles_data) == 0:
@@ -235,3 +227,555 @@ def run_aco(request):
             'success': False,
             'error': 'Método no permitido. Use POST.'
         }, status=405)  
+    
+
+
+#nuevos metodos para RL
+
+
+"""
+Nuevos endpoints para reasignación dinámica de rutas usando DQN.
+Este archivo debe agregarse como optimization/views_dqn.py
+"""
+
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+import json
+from optimization.service.route_manager import RouteManager
+
+# Instancia global del RouteManager (en producción, considerar usar caché o base de datos)
+_route_manager_instance = None
+
+
+def get_route_manager():
+    """Obtiene o crea la instancia del RouteManager"""
+    global _route_manager_instance
+    return _route_manager_instance
+
+
+def set_route_manager(manager):
+    """Establece la instancia del RouteManager"""
+    global _route_manager_instance
+    _route_manager_instance = manager
+
+
+@csrf_exempt
+def initialize_dqn(request):
+    """
+    Inicializa el sistema DQN con las rutas del algoritmo ACO.
+    
+    POST /optimization/dqn/initialize/
+    Body: {
+        "depot": {"lat": -12.087, "lng": -76.9718},
+        "vehicles": [...],
+        "routes": [...],
+        "model_path": "models/dqn_vrp_model.pth" (opcional)
+    }
+    """
+    if request.method != 'POST':
+        return JsonResponse({
+            'success': False,
+            'error': 'Método no permitido. Use POST.'
+        }, status=405)
+    
+    try:
+        data = json.loads(request.body)
+        
+        depot = data.get('depot', {'lat': -12.087, 'lng': -76.9718})
+        vehicles = data.get('vehicles', [])
+        routes = data.get('routes', [])
+        model_path = data.get('model_path', 'models/dqn_vrp_model.pth')
+        
+        if not vehicles:
+            return JsonResponse({
+                'success': False,
+                'error': 'No se proporcionaron vehículos.'
+            }, status=400)
+        
+        if not routes:
+            return JsonResponse({
+                'success': False,
+                'error': 'No se proporcionaron rutas iniciales.'
+            }, status=400)
+        
+        # Crear RouteManager
+        manager = RouteManager(
+            depot=depot,
+            vehicles=vehicles,
+            initial_routes=routes,
+            model_path=model_path
+        )
+        
+        set_route_manager(manager)
+        
+        return JsonResponse({
+            'success': True,
+            'message': 'Sistema DQN inicializado correctamente',
+            'state_size': manager.env.get_state_size(),
+            'action_size': manager.env.get_action_size(),
+            'epsilon': manager.agent.epsilon
+        })
+    
+    except json.JSONDecodeError:
+        return JsonResponse({
+            'success': False,
+            'error': 'JSON inválido en el cuerpo de la solicitud.'
+        }, status=400)
+    except Exception as e:
+        return JsonResponse({
+            'success': False,
+            'error': str(e),
+            'type': type(e).__name__
+        }, status=500)
+
+
+@csrf_exempt
+def add_order_dynamic(request):
+    """
+    Añade una nueva orden al sistema y la asigna dinámicamente usando DQN.
+    
+    POST /optimization/dqn/add-order/
+    Body: {
+        "order": {
+            "id": 16,
+            "weight": 500,
+            "pickupAddress": {"latitude": -12.0, "longitude": -77.0},
+            "deliveryAddress": {"latitude": -12.1, "longitude": -77.1},
+            "customer": {...}
+        },
+        "training": true (opcional, default: true)
+    }
+    """
+    if request.method != 'POST':
+        return JsonResponse({
+            'success': False,
+            'error': 'Método no permitido. Use POST.'
+        }, status=405)
+    
+    manager = get_route_manager()
+    if not manager:
+        return JsonResponse({
+            'success': False,
+            'error': 'Sistema DQN no inicializado. Llame a /dqn/initialize/ primero.'
+        }, status=400)
+    
+    try:
+        data = json.loads(request.body)
+        
+        order = data.get('order')
+        training = data.get('training', True)
+        
+        if not order:
+            return JsonResponse({
+                'success': False,
+                'error': 'No se proporcionó la orden.'
+            }, status=400)
+        
+        # Añadir orden
+        result = manager.add_order(order, training=training)
+        
+        return JsonResponse({
+            'success': True,
+            'result': result,
+            'updated_routes': manager.get_current_routes(),
+            'pending_orders': manager.get_pending_orders()
+        })
+    
+    except json.JSONDecodeError:
+        return JsonResponse({
+            'success': False,
+            'error': 'JSON inválido en el cuerpo de la solicitud.'
+        }, status=400)
+    except Exception as e:
+        return JsonResponse({
+            'success': False,
+            'error': str(e),
+            'type': type(e).__name__
+        }, status=500)
+
+
+@csrf_exempt
+def cancel_order_dynamic(request):
+    """
+    Cancela una orden existente.
+    
+    POST /optimization/dqn/cancel-order/
+    Body: {
+        "order_id": 16
+    }
+    """
+    if request.method != 'POST':
+        return JsonResponse({
+            'success': False,
+            'error': 'Método no permitido. Use POST.'
+        }, status=405)
+    
+    manager = get_route_manager()
+    if not manager:
+        return JsonResponse({
+            'success': False,
+            'error': 'Sistema DQN no inicializado.'
+        }, status=400)
+    
+    try:
+        data = json.loads(request.body)
+        
+        order_id = data.get('order_id')
+        
+        if not order_id:
+            return JsonResponse({
+                'success': False,
+                'error': 'No se proporcionó el order_id.'
+            }, status=400)
+        
+        # Cancelar orden
+        result = manager.cancel_order(order_id)
+        
+        return JsonResponse({
+            'success': True,
+            'result': result,
+            'updated_routes': manager.get_current_routes()
+        })
+    
+    except json.JSONDecodeError:
+        return JsonResponse({
+            'success': False,
+            'error': 'JSON inválido en el cuerpo de la solicitud.'
+        }, status=400)
+    except Exception as e:
+        return JsonResponse({
+            'success': False,
+            'error': str(e),
+            'type': type(e).__name__
+        }, status=500)
+
+
+@csrf_exempt
+def remove_vehicle_dynamic(request):
+    """
+    Remueve un vehículo y reasigna sus órdenes.
+    
+    POST /optimization/dqn/remove-vehicle/
+    Body: {
+        "vehicle_id": 25,
+        "training": true (opcional, default: true)
+    }
+    """
+    if request.method != 'POST':
+        return JsonResponse({
+            'success': False,
+            'error': 'Método no permitido. Use POST.'
+        }, status=405)
+    
+    manager = get_route_manager()
+    if not manager:
+        return JsonResponse({
+            'success': False,
+            'error': 'Sistema DQN no inicializado.'
+        }, status=400)
+    
+    try:
+        data = json.loads(request.body)
+        
+        vehicle_id = data.get('vehicle_id')
+        training = data.get('training', True)
+        
+        if not vehicle_id:
+            return JsonResponse({
+                'success': False,
+                'error': 'No se proporcionó el vehicle_id.'
+            }, status=400)
+        
+        # Remover vehículo
+        result = manager.remove_vehicle(vehicle_id, training=training)
+        
+        return JsonResponse({
+            'success': True,
+            'result': result,
+            'updated_routes': manager.get_current_routes(),
+            'pending_orders': manager.get_pending_orders()
+        })
+    
+    except json.JSONDecodeError:
+        return JsonResponse({
+            'success': False,
+            'error': 'JSON inválido en el cuerpo de la solicitud.'
+        }, status=400)
+    except Exception as e:
+        return JsonResponse({
+            'success': False,
+            'error': str(e),
+            'type': type(e).__name__
+        }, status=500)
+
+
+@csrf_exempt
+def batch_add_orders(request):
+    """
+    Añade múltiples órdenes en batch.
+    
+    POST /optimization/dqn/batch-add-orders/
+    Body: {
+        "orders": [
+            {"id": 16, "weight": 500, ...},
+            {"id": 17, "weight": 600, ...}
+        ],
+        "training": true (opcional, default: true)
+    }
+    """
+    if request.method != 'POST':
+        return JsonResponse({
+            'success': False,
+            'error': 'Método no permitido. Use POST.'
+        }, status=405)
+    
+    manager = get_route_manager()
+    if not manager:
+        return JsonResponse({
+            'success': False,
+            'error': 'Sistema DQN no inicializado.'
+        }, status=400)
+    
+    try:
+        data = json.loads(request.body)
+        
+        orders = data.get('orders', [])
+        training = data.get('training', True)
+        
+        if not orders:
+            return JsonResponse({
+                'success': False,
+                'error': 'No se proporcionaron órdenes.'
+            }, status=400)
+        
+        # Añadir órdenes en batch
+        result = manager.batch_add_orders(orders, training=training)
+        
+        return JsonResponse({
+            'success': True,
+            'result': result,
+            'updated_routes': manager.get_current_routes(),
+            'pending_orders': manager.get_pending_orders()
+        })
+    
+    except json.JSONDecodeError:
+        return JsonResponse({
+            'success': False,
+            'error': 'JSON inválido en el cuerpo de la solicitud.'
+        }, status=400)
+    except Exception as e:
+        return JsonResponse({
+            'success': False,
+            'error': str(e),
+            'type': type(e).__name__
+        }, status=500)
+
+
+@csrf_exempt
+def get_current_routes(request):
+    """
+    Obtiene las rutas actuales.
+    
+    GET /optimization/dqn/current-routes/
+    """
+    if request.method != 'GET':
+        return JsonResponse({
+            'success': False,
+            'error': 'Método no permitido. Use GET.'
+        }, status=405)
+    
+    manager = get_route_manager()
+    if not manager:
+        return JsonResponse({
+            'success': False,
+            'error': 'Sistema DQN no inicializado.'
+        }, status=400)
+    
+    try:
+        routes = manager.get_current_routes()
+        pending_orders = manager.get_pending_orders()
+        
+        return JsonResponse({
+            'success': True,
+            'routes': routes,
+            'pending_orders': pending_orders,
+            'num_routes': len(routes),
+            'num_pending': len(pending_orders)
+        })
+    
+    except Exception as e:
+        return JsonResponse({
+            'success': False,
+            'error': str(e),
+            'type': type(e).__name__
+        }, status=500)
+
+
+@csrf_exempt
+def get_statistics(request):
+    """
+    Obtiene estadísticas del sistema.
+    
+    GET /optimization/dqn/statistics/
+    """
+    if request.method != 'GET':
+        return JsonResponse({
+            'success': False,
+            'error': 'Método no permitido. Use GET.'
+        }, status=405)
+    
+    manager = get_route_manager()
+    if not manager:
+        return JsonResponse({
+            'success': False,
+            'error': 'Sistema DQN no inicializado.'
+        }, status=400)
+    
+    try:
+        stats = manager.get_statistics()
+        
+        return JsonResponse({
+            'success': True,
+            'statistics': stats
+        })
+    
+    except Exception as e:
+        return JsonResponse({
+            'success': False,
+            'error': str(e),
+            'type': type(e).__name__
+        }, status=500)
+
+
+@csrf_exempt
+def save_model(request):
+    """
+    Guarda el modelo DQN entrenado.
+    
+    POST /optimization/dqn/save-model/
+    """
+    if request.method != 'POST':
+        return JsonResponse({
+            'success': False,
+            'error': 'Método no permitido. Use POST.'
+        }, status=405)
+    
+    manager = get_route_manager()
+    if not manager:
+        return JsonResponse({
+            'success': False,
+            'error': 'Sistema DQN no inicializado.'
+        }, status=400)
+    
+    try:
+        result = manager.save_model()
+        
+        return JsonResponse({
+            'success': True,
+            'message': 'Modelo guardado correctamente',
+            'result': result
+        })
+    
+    except Exception as e:
+        return JsonResponse({
+            'success': False,
+            'error': str(e),
+            'type': type(e).__name__
+        }, status=500)
+
+
+@csrf_exempt
+def train_batch(request):
+    """
+    Entrena el agente DQN con las experiencias almacenadas.
+    
+    POST /optimization/dqn/train/
+    Body: {
+        "num_episodes": 100 (opcional, default: 100)
+    }
+    """
+    if request.method != 'POST':
+        return JsonResponse({
+            'success': False,
+            'error': 'Método no permitido. Use POST.'
+        }, status=405)
+    
+    manager = get_route_manager()
+    if not manager:
+        return JsonResponse({
+            'success': False,
+            'error': 'Sistema DQN no inicializado.'
+        }, status=400)
+    
+    try:
+        data = json.loads(request.body) if request.body else {}
+        num_episodes = data.get('num_episodes', 100)
+        
+        # Entrenar
+        result = manager.train_batch(num_episodes=num_episodes)
+        
+        return JsonResponse({
+            'success': True,
+            'message': 'Entrenamiento completado',
+            'result': result
+        })
+    
+    except json.JSONDecodeError:
+        return JsonResponse({
+            'success': False,
+            'error': 'JSON inválido en el cuerpo de la solicitud.'
+        }, status=400)
+    except Exception as e:
+        return JsonResponse({
+            'success': False,
+            'error': str(e),
+            'type': type(e).__name__
+        }, status=500)
+
+
+@csrf_exempt
+def reset_environment(request):
+    """
+    Reinicia el ambiente (útil después de re-ejecutar ACO).
+    
+    POST /optimization/dqn/reset/
+    Body: {
+        "routes": [...] (opcional, usa las rutas actuales si no se proporciona)
+    }
+    """
+    if request.method != 'POST':
+        return JsonResponse({
+            'success': False,
+            'error': 'Método no permitido. Use POST.'
+        }, status=405)
+    
+    manager = get_route_manager()
+    if not manager:
+        return JsonResponse({
+            'success': False,
+            'error': 'Sistema DQN no inicializado.'
+        }, status=400)
+    
+    try:
+        data = json.loads(request.body) if request.body else {}
+        new_routes = data.get('routes')
+        
+        result = manager.reset_environment(new_routes)
+        
+        return JsonResponse({
+            'success': True,
+            'result': result,
+            'current_routes': manager.get_current_routes()
+        })
+    
+    except json.JSONDecodeError:
+        return JsonResponse({
+            'success': False,
+            'error': 'JSON inválido en el cuerpo de la solicitud.'
+        }, status=400)
+    except Exception as e:
+        return JsonResponse({
+            'success': False,
+            'error': str(e),
+            'type': type(e).__name__
+        }, status=500)
