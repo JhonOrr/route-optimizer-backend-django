@@ -3,5 +3,8 @@ from . import views
 
 urlpatterns = [
   path('run-aco/', views.run_aco, name='prueba_api'),
-  path('get-last-route/', views.get_last_route, name='get_last_route'),
-]
+  path('sync-and-optimize/', views.sync_and_optimize_dqn, name='prueba_api'),
+  path('sync-status/', views.get_sync_status
+       , name='prueba_api'),
+  path('current-routes/', views.get_current_routes, name='prueba_api'),
+] 
