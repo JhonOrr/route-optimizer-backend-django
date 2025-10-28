@@ -1,5 +1,6 @@
 import os
 import json
+import numpy as np
 from typing import List, Dict, Optional, Tuple
 from .dqn_environment import VRPEnvironment
 from .dqn_agent import DQNAgent
@@ -8,10 +9,12 @@ from .dqn_agent import DQNAgent
 class RouteManager:
     """
     Gestor central para reasignación dinámica de rutas usando DQN.
+    Maneja estados de órdenes y posiciones actuales de vehículos.
     
     Coordina:
     - Adición de nuevas órdenes
     - Cancelación de órdenes
+    - Cambios de estado de órdenes
     - Remoción de vehículos
     - Entrenamiento del agente DQN
     """
@@ -65,6 +68,7 @@ class RouteManager:
     def add_order(self, order: Dict, training: bool = True) -> Dict:
         """
         Añade una nueva orden al sistema y la asigna usando DQN.
+        Considera el estado de la orden para determinar las paradas pendientes.
         
         Args:
             order: Nueva orden a asignar
@@ -73,6 +77,21 @@ class RouteManager:
         Returns:
             Dict con resultado de la operación
         """
+        # Verificar si la orden es accionable
+        status = self._normalize_status(order.get('status', 'pendiente'))
+        
+        if status in ['cancelada', 'completo', 'pospuesta']:
+            return {
+                'type': 'add_order',
+                'order_id': order.get('id'),
+                'assigned': False,
+                'vehicle_id': None,
+                'reward': 0,
+                'loss': None,
+                'epsilon': self.agent.epsilon,
+                'reason': f'order_status_{status}'
+            }
+        
         # Agregar orden al ambiente
         self.env.add_new_order(order)
         
@@ -100,11 +119,57 @@ class RouteManager:
         operation_result = {
             'type': 'add_order',
             'order_id': order.get('id'),
+            'order_status': status,
             'assigned': info['assigned'],
             'vehicle_id': info.get('vehicle_id'),
             'reward': reward,
             'loss': loss,
-            'epsilon': self.agent.epsilon
+            'epsilon': self.agent.epsilon,
+            'pending_stops': len(self.env.get_pending_stops_for_order(order))
+        }
+        
+        self.operations_log.append(operation_result)
+        
+        return operation_result
+    
+    def update_order_status(self, order_id: int, new_status: str, training: bool = True) -> Dict:
+        """
+        Actualiza el estado de una orden existente.
+        
+        Estados:
+        - 'pendiente' (1): Requiere pickup y delivery
+        - 'recogido' (2): Solo requiere delivery
+        - 'completo' (3): Ya fue entregada, se remueve de rutas
+        - 'cancelada' (4): Se remueve de rutas
+        - 'pospuesta' (5): Se remueve de rutas (no se reasigna)
+        
+        Args:
+            order_id: ID de la orden
+            new_status: Nuevo estado
+            training: Si es True, entrena durante la operación
+            
+        Returns:
+            Dict con resultado de la operación
+        """
+        normalized_status = self._normalize_status(new_status)
+        
+        # Actualizar estado en el ambiente
+        result = self.env.update_order_status(order_id, normalized_status)
+        
+        # Si cambió a cancelada, completo o pospuesta, cancelar
+        if normalized_status in ['cancelada', 'completo', 'pospuesta']:
+            cancel_result = self.cancel_order(order_id)
+            result.update(cancel_result)
+        
+        # Actualizar rutas actuales
+        self.current_routes = self.env.current_routes
+        
+        operation_result = {
+            'type': 'status_change',
+            'order_id': order_id,
+            'new_status': normalized_status,
+            'success': result.get('updated', False),
+            'removed_from_routes': normalized_status in ['cancelada', 'completo', 'pospuesta']
         }
         
         self.operations_log.append(operation_result)
@@ -141,6 +206,10 @@ class RouteManager:
         """
         Remueve un vehículo y reasigna sus órdenes a otros vehículos.
         
+        IMPORTANTE: Solo reasigna órdenes en estado "pendiente" (1).
+        Las órdenes en estado "recogido" (2) Spring Boot las cambia a "pospuesta" (5)
+        y NO deben ser reasignadas por DQN.
+        
         Args:
             vehicle_id: ID del vehículo a remover
             training: Si es True, entrena durante la reasignación
@@ -148,14 +217,15 @@ class RouteManager:
         Returns:
             Dict con resultado de la operación
         """
-        # Obtener órdenes que deben ser reasignadas
+        # Obtener órdenes que deben ser reasignadas (solo pendientes)
         orders_to_reassign = self.env.remove_vehicle(vehicle_id)
         
         reassignment_results = []
         successful_reassignments = 0
         pending_orders = []
+        postponed_count = 0
         
-        # Intentar reasignar cada orden
+        # Intentar reasignar cada orden pendiente
         for order in orders_to_reassign:
             result = self.add_order(order, training=training)
             reassignment_results.append(result)
@@ -175,6 +245,7 @@ class RouteManager:
             'successful_reassignments': successful_reassignments,
             'pending_orders': len(pending_orders),
             'pending_order_ids': [o.get('id') for o in pending_orders],
+            'note': 'Orders with status "recogido" were changed to "pospuesta" by Spring Boot and are NOT reassigned',
             'reassignment_details': reassignment_results
         }
         
@@ -196,8 +267,19 @@ class RouteManager:
         results = []
         successful_assignments = 0
         pending_orders = []
+        skipped_orders = []
         
         for order in orders:
+            status = self._normalize_status(order.get('status', 'pendiente'))
+            
+            # Solo procesar órdenes activas (pendiente o recogido)
+            if status in ['cancelada', 'completo', 'pospuesta']:
+                skipped_orders.append({
+                    'order_id': order.get('id'),
+                    'reason': f'status_{status}'
+                })
+                continue
+            
             result = self.add_order(order, training=training)
             results.append(result)
             
@@ -209,10 +291,13 @@ class RouteManager:
         summary = {
             'type': 'batch_add_orders',
             'total_orders': len(orders),
+            'processed_orders': len(results),
+            'skipped_orders': len(skipped_orders),
             'successful_assignments': successful_assignments,
             'pending_orders': len(pending_orders),
             'pending_order_ids': pending_orders,
-            'assignment_rate': successful_assignments / len(orders) if orders else 0,
+            'skipped_order_details': skipped_orders,
+            'assignment_rate': successful_assignments / len(results) if results else 0,
             'details': results
         }
         
@@ -227,6 +312,10 @@ class RouteManager:
     def get_pending_orders(self) -> List[Dict]:
         """Retorna las órdenes pendientes de asignación"""
         return self.env.pending_orders
+    
+    def get_vehicle_positions(self) -> Dict:
+        """Retorna las posiciones actuales de todos los vehículos"""
+        return self.env.vehicle_positions.copy()
     
     def save_model(self):
         """Guarda el modelo DQN entrenado"""
@@ -261,15 +350,44 @@ class RouteManager:
                     if stop['type'] == 'pickup'
                 )
                 utilization = (current_load / vehicle['capacity']) * 100
+                
+                # Posición actual del vehículo
+                position = self.env.vehicle_positions.get(vehicle['id'], self.depot)
+                
                 vehicle_utilization.append({
                     'vehicle_id': vehicle['id'],
                     'utilization': utilization,
                     'distance_used': route['total_distance'],
-                    'distance_capacity': vehicle['max_distance']
+                    'distance_capacity': vehicle['max_distance'],
+                    'current_position': position
                 })
         
         # Estadísticas del agente
         agent_stats = self.agent.get_stats()
+        
+        # Contar órdenes por estado en rutas actuales
+        order_states = {'pendiente': 0, 'recogido': 0, 'completada': 0}
+        processed_orders = set()
+        
+        for route in self.current_routes:
+            for stop in route['stops']:
+                order_id = stop.get('order_id')
+                if order_id and order_id not in processed_orders:
+                    processed_orders.add(order_id)
+                    # Determinar estado basado en paradas presentes
+                    has_pickup = any(
+                        s.get('order_id') == order_id and s['type'] == 'pickup' 
+                        for s in route['stops']
+                    )
+                    has_delivery = any(
+                        s.get('order_id') == order_id and s['type'] == 'delivery' 
+                        for s in route['stops']
+                    )
+                    
+                    if has_pickup and has_delivery:
+                        order_states['pendiente'] += 1
+                    elif has_delivery and not has_pickup:
+                        order_states['recogido'] += 1
         
         return {
             'total_distance': total_distance,
@@ -279,6 +397,7 @@ class RouteManager:
             'avg_vehicle_utilization': np.mean([v['utilization'] for v in vehicle_utilization]) if vehicle_utilization else 0,
             'agent_epsilon': self.agent.epsilon,
             'total_operations': len(self.operations_log),
+            'order_states_in_routes': order_states,
             'agent_training_stats': agent_stats
         }
     
@@ -322,11 +441,29 @@ class RouteManager:
             'success': True,
             'message': 'Ambiente reiniciado correctamente'
         }
-
-
-# Importar numpy si no está disponible globalmente
-try:
-    import numpy as np
-except ImportError:
-    import warnings
-    warnings.warn("NumPy no está instalado. Algunas funciones pueden no funcionar correctamente.")
+    
+    def _normalize_status(self, status) -> str:
+        """
+        Normaliza el estado de la orden a un formato estándar.
+        
+        Mapeo desde Spring Boot:
+        - '1' o 'pendiente' -> 'pendiente'
+        - '2' o 'recogido' -> 'recogido'
+        - '3' o 'completo' -> 'completo'
+        - '4' o 'cancelada' -> 'cancelada'
+        - '5' o 'pospuesta' -> 'pospuesta'
+        """
+        status_str = str(status).lower().strip()
+        
+        if status_str in ['1', 'pendiente']:
+            return 'pendiente'
+        elif status_str in ['2', 'recogido']:
+            return 'recogido'
+        elif status_str in ['3', 'completo', 'completada']:
+            return 'completo'
+        elif status_str in ['4', 'cancelada']:
+            return 'cancelada'
+        elif status_str in ['5', 'pospuesta']:
+            return 'pospuesta'
+        else:
+            return 'pendiente'  # Por defecto

@@ -1,6 +1,6 @@
 """
 Views integradas para ACO y DQN con sincronización automática.
-Archivo: optimization/views.py
+Incluye manejo de estados de órdenes y posiciones de vehículos.
 """
 
 from django.http import JsonResponse
@@ -62,14 +62,25 @@ def run_aco(request):
                     'error': 'No se encontraron vehículos disponibles.'
                 }, status=400)
             
-            # Filtrar órdenes y vehículos activos
-            active_orders = [o for o in orders_data if o.get('status') == '1']
-            active_vehicles = [v for v in vehicles_data if v.get('status') == 1]
+            # Filtrar órdenes PENDIENTES y vehículos activos
+            # ACO SOLO procesa órdenes en estado "pendiente" (1)
+            all_orders = sync_service.fetch_current_data()[0]
+            pending_orders = [
+                o for o in all_orders 
+                if sync_service._normalize_status(o.get('status')) == 'pendiente'
+            ]
+            active_vehicles = sync_service.get_active_vehicles()
             
-            if not active_orders:
+            if not pending_orders:
                 return JsonResponse({
                     'success': False,
-                    'error': 'No se encontraron órdenes activas para procesar.'
+                    'error': 'No se encontraron órdenes PENDIENTES para procesar. ACO requiere órdenes en estado "pendiente" (1).'
+                }, status=400)
+            
+            if not active_vehicles:
+                return JsonResponse({
+                    'success': False,
+                    'error': 'No se encontraron vehículos activos.'
                 }, status=400)
             
             # Crear ejecución en BD
@@ -82,9 +93,10 @@ def run_aco(request):
                     'evaporation_rate': evaporation_rate,
                     'alpha': alpha,
                     'beta': beta,
-                    'max_distance': max_distance
+                    'max_distance': max_distance,
+                    'note': 'ACO solo procesa órdenes PENDIENTES (estado 1)'
                 },
-                num_orders_processed=len(active_orders),
+                num_orders_processed=len(pending_orders),
                 num_vehicles_used=len(active_vehicles)
             )
             
@@ -98,14 +110,15 @@ def run_aco(request):
                     vehicles.append([capacity, max_distance])
                     vehicle_id_map.append(vehicle.get('id'))
                 
-                # Construir nodos
+                # Construir nodos - TODAS las órdenes pendientes incluyen pickup + delivery
                 nodes = [['depot', depot_lat, depot_lng, 0]]
                 node_to_order_map = {}
                 
-                for order in active_orders:
+                for order in pending_orders:
                     pickup_address = order.get('pickupAddress')
                     delivery_address = order.get('deliveryAddress')
                     
+                    # Validar que tenga ambas direcciones
                     if not pickup_address or not delivery_address:
                         continue
                     
@@ -115,6 +128,7 @@ def run_aco(request):
                     delivery_lng = float(delivery_address.get('longitude'))
                     capacity = float(order.get('weight', 0))
                     
+                    # Siempre agregar pickup + delivery (todas son pendientes)
                     pickup_node_idx = len(nodes)
                     delivery_node_idx = len(nodes) + 1
                     
@@ -209,17 +223,28 @@ def run_aco(request):
                 execution.routes = routes
                 execution.save()
                 
+                # Extraer posiciones de vehículos
+                depot_dict = {'lat': depot_lat, 'lng': depot_lng}
+                vehicle_positions = sync_service.extract_vehicle_positions_from_routes(routes, depot_dict)
+                
+                # Agregar posiciones a los vehículos
+                for vehicle in active_vehicles:
+                    vehicle['current_position'] = vehicle_positions.get(
+                        vehicle['id'], 
+                        depot_dict
+                    )
+                
                 # Guardar snapshot
-                sync_service.save_snapshot(execution, active_orders, active_vehicles)
+                sync_service.save_snapshot(execution, pending_orders, active_vehicles)
                 sync_service.save_route_assignments(execution, routes)
                 
                 # Inicializar DQN con estas rutas
-                depot_dict = {'lat': depot_lat, 'lng': depot_lng}
                 vehicles_dqn = [
                     {
                         'id': v['id'],
                         'capacity': v['capacity'],
-                        'max_distance': max_distance
+                        'max_distance': max_distance,
+                        'current_position': v.get('current_position', depot_dict)
                     }
                     for v in active_vehicles
                 ]
@@ -252,7 +277,12 @@ def run_aco(request):
                     'best_distance': best_distance,
                     'parameters': execution.parameters,
                     'routes': routes,
-                    'dqn_initialized': True
+                    'dqn_initialized': True,
+                    'orders_processed': {
+                        'total': len(pending_orders),
+                        'status': 'All orders are PENDIENTE (state 1) - pickup + delivery included'
+                    },
+                    'note': 'ACO initial optimization completed. Use /sync-and-optimize/ for dynamic reassignments.'
                 })
             
             except Exception as e:
@@ -283,7 +313,7 @@ def run_aco(request):
 def sync_and_optimize_dqn(request):
     """
     Sincroniza datos desde Spring Boot, detecta cambios y aplica DQN.
-    Este es el endpoint principal para optimización dinámica.
+    Maneja estados de órdenes y posiciones de vehículos.
     
     POST /optimization/sync-and-optimize/
     """
@@ -317,7 +347,8 @@ def sync_and_optimize_dqn(request):
                 {
                     'id': v['id'],
                     'capacity': v['capacity'],
-                    'max_distance': v['max_distance']
+                    'max_distance': v['max_distance'],
+                    'current_position': v.get('current_position', depot)
                 }
                 for v in previous_vehicles if v.get('status') == 1
             ]
@@ -342,7 +373,8 @@ def sync_and_optimize_dqn(request):
                 'message': 'No hay cambios detectados. Rutas actuales se mantienen.',
                 'sync_info': sync_result,
                 'current_routes': route_manager.get_current_routes(),
-                'pending_orders': route_manager.get_pending_orders()
+                'pending_orders': route_manager.get_pending_orders(),
+                'vehicle_positions': route_manager.get_vehicle_positions()
             })
         
         # Crear nueva ejecución para registrar cambios DQN
@@ -362,7 +394,6 @@ def sync_and_optimize_dqn(request):
                 result = route_manager.remove_vehicle(vehicle_id, training=True)
                 operation_results.append(result)
                 
-                # Registrar operación
                 OperationLog.objects.create(
                     execution=execution,
                     operation_type='remove_vehicle',
@@ -371,30 +402,38 @@ def sync_and_optimize_dqn(request):
                     details=result
                 )
             
-            # 2. Procesar órdenes canceladas
-            for order_id in changes['cancelled_orders']:
-                result = route_manager.cancel_order(order_id)
+            # 2. Procesar cambios de estado de órdenes
+            for status_change in changes['status_changed_orders']:
+                order_id = status_change['order_id']
+                new_status = status_change['new_status']
+                
+                result = route_manager.update_order_status(order_id, new_status, training=True)
                 operation_results.append(result)
                 
                 OperationLog.objects.create(
                     execution=execution,
-                    operation_type='cancel_order',
+                    operation_type='status_change',
                     order_id=order_id,
                     success=result['success'],
                     details=result
                 )
             
-            # 3. Procesar cambios de estado de órdenes
-            for status_change in changes['status_changed_orders']:
-                if status_change['new_status'] != '1':
-                    # Si cambió a inactivo, cancelar
-                    result = route_manager.cancel_order(status_change['order_id'])
+            # 3. Procesar órdenes canceladas explícitas
+            for order_id in changes['cancelled_orders']:
+                # Verificar si no fue procesada ya en cambios de estado
+                already_processed = any(
+                    sc['order_id'] == order_id 
+                    for sc in changes['status_changed_orders']
+                )
+                
+                if not already_processed:
+                    result = route_manager.cancel_order(order_id)
                     operation_results.append(result)
                     
                     OperationLog.objects.create(
                         execution=execution,
                         operation_type='cancel_order',
-                        order_id=status_change['order_id'],
+                        order_id=order_id,
                         success=result['success'],
                         details=result
                     )
@@ -420,6 +459,7 @@ def sync_and_optimize_dqn(request):
             # Obtener rutas actualizadas
             updated_routes = route_manager.get_current_routes()
             pending_orders = route_manager.get_pending_orders()
+            vehicle_positions = route_manager.get_vehicle_positions()
             
             # Calcular distancia total
             total_distance = sum(route['total_distance'] for route in updated_routes)
@@ -436,6 +476,14 @@ def sync_and_optimize_dqn(request):
             # Guardar snapshot actualizado
             active_orders = sync_service.get_active_orders()
             active_vehicles = sync_service.get_active_vehicles()
+            
+            # Agregar posiciones actuales a vehículos
+            for vehicle in active_vehicles:
+                vehicle['current_position'] = vehicle_positions.get(
+                    vehicle['id'],
+                    {'lat': -12.087, 'lng': -76.9718}
+                )
+            
             sync_service.save_snapshot(execution, active_orders, active_vehicles)
             sync_service.save_route_assignments(execution, updated_routes)
             
@@ -464,6 +512,7 @@ def sync_and_optimize_dqn(request):
                 'operation_results': operation_results,
                 'updated_routes': updated_routes,
                 'pending_orders': pending_orders,
+                'vehicle_positions': vehicle_positions,
                 'total_distance': total_distance,
                 'statistics': route_manager.get_statistics()
             })
@@ -518,154 +567,9 @@ def get_sync_status(request):
 
 
 @csrf_exempt
-def get_execution_history(request):
-    """
-    Obtiene el historial de ejecuciones.
-    
-    GET /optimization/execution-history/?limit=10
-    """
-    if request.method != 'GET':
-        return JsonResponse({
-            'success': False,
-            'error': 'Método no permitido. Use GET.'
-        }, status=405)
-    
-    try:
-        limit = int(request.GET.get('limit', 10))
-        
-        executions = OptimizationExecution.objects.all()[:limit]
-        
-        history = []
-        for execution in executions:
-            history.append({
-                'id': execution.id,
-                'algorithm': execution.algorithm,
-                'status': execution.status,
-                'executed_at': execution.executed_at.isoformat(),
-                'completed_at': execution.completed_at.isoformat() if execution.completed_at else None,
-                'best_distance': execution.best_distance,
-                'num_orders_processed': execution.num_orders_processed,
-                'num_vehicles_used': execution.num_vehicles_used,
-                'parameters': execution.parameters,
-                'error_message': execution.error_message
-            })
-        
-        return JsonResponse({
-            'success': True,
-            'history': history,
-            'count': len(history)
-        })
-    
-    except Exception as e:
-        return JsonResponse({
-            'success': False,
-            'error': str(e),
-            'type': type(e).__name__
-        }, status=500)
-
-
-@csrf_exempt
-def get_execution_detail(request, execution_id):
-    """
-    Obtiene el detalle completo de una ejecución.
-    
-    GET /optimization/execution/<id>/
-    """
-    if request.method != 'GET':
-        return JsonResponse({
-            'success': False,
-            'error': 'Método no permitido. Use GET.'
-        }, status=405)
-    
-    try:
-        execution = OptimizationExecution.objects.get(id=execution_id)
-        
-        # Obtener logs de operaciones si es DQN
-        operation_logs = []
-        if execution.algorithm == 'dqn':
-            logs = OperationLog.objects.filter(execution=execution)
-            operation_logs = [
-                {
-                    'operation_type': log.operation_type,
-                    'order_id': log.order_id,
-                    'vehicle_id': log.vehicle_id,
-                    'success': log.success,
-                    'assigned': log.assigned,
-                    'reward': log.reward,
-                    'created_at': log.created_at.isoformat(),
-                    'details': log.details
-                }
-                for log in logs
-            ]
-        
-        # Obtener órdenes procesadas
-        orders = OrderSnapshot.objects.filter(execution=execution)
-        order_list = [
-            {
-                'order_id': order.order_id,
-                'weight': order.weight,
-                'status': order.status,
-                'pickup': {
-                    'lat': order.pickup_lat,
-                    'lng': order.pickup_lng
-                },
-                'delivery': {
-                    'lat': order.delivery_lat,
-                    'lng': order.delivery_lng
-                }
-            }
-            for order in orders
-        ]
-        
-        # Obtener vehículos
-        vehicles = VehicleSnapshot.objects.filter(execution=execution)
-        vehicle_list = [
-            {
-                'vehicle_id': vehicle.vehicle_id,
-                'capacity': vehicle.capacity,
-                'max_distance': vehicle.max_distance,
-                'status': vehicle.status
-            }
-            for vehicle in vehicles
-        ]
-        
-        return JsonResponse({
-            'success': True,
-            'execution': {
-                'id': execution.id,
-                'algorithm': execution.algorithm,
-                'status': execution.status,
-                'executed_at': execution.executed_at.isoformat(),
-                'completed_at': execution.completed_at.isoformat() if execution.completed_at else None,
-                'best_distance': execution.best_distance,
-                'num_orders_processed': execution.num_orders_processed,
-                'num_vehicles_used': execution.num_vehicles_used,
-                'parameters': execution.parameters,
-                'routes': execution.routes,
-                'error_message': execution.error_message
-            },
-            'orders': order_list,
-            'vehicles': vehicle_list,
-            'operation_logs': operation_logs
-        })
-    
-    except OptimizationExecution.DoesNotExist:
-        return JsonResponse({
-            'success': False,
-            'error': f'Ejecución con ID {execution_id} no encontrada.'
-        }, status=404)
-    except Exception as e:
-        return JsonResponse({
-            'success': False,
-            'error': str(e),
-            'type': type(e).__name__
-        }, status=500)
-
-
-@csrf_exempt
 def get_current_routes(request):
     """
-    Obtiene las rutas actuales del RouteManager.
+    Obtiene las rutas actuales del RouteManager con posiciones de vehículos.
     
     GET /optimization/current-routes/
     """
@@ -701,76 +605,15 @@ def get_current_routes(request):
         routes = route_manager.get_current_routes()
         pending = route_manager.get_pending_orders()
         stats = route_manager.get_statistics()
+        positions = route_manager.get_vehicle_positions()
         
         return JsonResponse({
             'success': True,
             'routes': routes,
             'pending_orders': pending,
+            'vehicle_positions': positions,
             'statistics': stats,
             'from_database': False
-        })
-    
-    except Exception as e:
-        return JsonResponse({
-            'success': False,
-            'error': str(e),
-            'type': type(e).__name__
-        }, status=500)
-
-
-@csrf_exempt
-def get_dqn_statistics(request):
-    """
-    Obtiene estadísticas del sistema DQN.
-    
-    GET /optimization/dqn-statistics/
-    """
-    if request.method != 'GET':
-        return JsonResponse({
-            'success': False,
-            'error': 'Método no permitido. Use GET.'
-        }, status=405)
-    
-    try:
-        dqn_state = DQNState.objects.first()
-        
-        if not dqn_state:
-            return JsonResponse({
-                'success': False,
-                'error': 'Sistema DQN no inicializado.'
-            }, status=404)
-        
-        route_manager = get_route_manager()
-        
-        stats = {
-            'dqn_state': {
-                'epsilon': dqn_state.epsilon,
-                'total_episodes': dqn_state.total_episodes,
-                'total_operations': dqn_state.total_operations,
-                'last_execution_id': dqn_state.last_execution_id,
-                'updated_at': dqn_state.updated_at.isoformat()
-            }
-        }
-        
-        if route_manager:
-            stats['current_statistics'] = route_manager.get_statistics()
-        
-        # Estadísticas de operaciones
-        total_operations = OperationLog.objects.count()
-        successful_assignments = OperationLog.objects.filter(
-            operation_type='add_order',
-            assigned=True
-        ).count()
-        
-        stats['operation_statistics'] = {
-            'total_operations': total_operations,
-            'successful_assignments': successful_assignments,
-            'assignment_rate': successful_assignments / total_operations if total_operations > 0 else 0
-        }
-        
-        return JsonResponse({
-            'success': True,
-            'statistics': stats
         })
     
     except Exception as e:

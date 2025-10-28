@@ -1,6 +1,6 @@
 """
 Servicio para sincronizar datos desde Spring Boot y detectar cambios.
-Archivo: optimization/service/sync_service.py
+Maneja estados de órdenes y posiciones actuales de vehículos.
 """
 
 from typing import Dict, List, Tuple, Optional
@@ -89,7 +89,11 @@ class SyncService:
                 'id': snapshot.vehicle_id,
                 'capacity': snapshot.capacity,
                 'max_distance': snapshot.max_distance,
-                'status': snapshot.status
+                'status': snapshot.status,
+                'current_position': {
+                    'lat': snapshot.current_lat,
+                    'lng': snapshot.current_lng
+                } if snapshot.current_lat and snapshot.current_lng else None
             }
             vehicles.append(vehicle)
         
@@ -127,31 +131,41 @@ class SyncService:
         prev_vehicle_ids = {v['id'] for v in self.previous_vehicles if v.get('status') == 1}
         curr_vehicle_ids = {v['id'] for v in self.current_vehicles if v.get('status') == 1}
         
-        # Detectar nuevas órdenes
+        # Detectar nuevas órdenes (solo las activas: pendiente o recogido)
         new_order_ids = curr_order_ids - prev_order_ids
         changes['new_orders'] = [
             o for o in self.current_orders 
-            if o['id'] in new_order_ids and o.get('status') == '1'
+            if o['id'] in new_order_ids and self._is_order_active(o.get('status'))
         ]
         
-        # Detectar órdenes canceladas
-        cancelled_order_ids = prev_order_ids - curr_order_ids
-        changes['cancelled_orders'] = list(cancelled_order_ids)
-        
-        # Detectar cambios de estado en órdenes
+        # Detectar órdenes canceladas o completadas
         for curr_order in self.current_orders:
             prev_order = next(
                 (o for o in self.previous_orders if o['id'] == curr_order['id']), 
                 None
             )
-            if prev_order and prev_order.get('status') != curr_order.get('status'):
-                changes['status_changed_orders'].append({
-                    'order_id': curr_order['id'],
-                    'old_status': prev_order.get('status'),
-                    'new_status': curr_order.get('status')
-                })
+            
+            # Si la orden cambió a cancelada o completada
+            if prev_order:
+                prev_status = self._normalize_status(prev_order.get('status'))
+                curr_status = self._normalize_status(curr_order.get('status'))
+                
+                if prev_status != curr_status:
+                    changes['status_changed_orders'].append({
+                        'order_id': curr_order['id'],
+                        'old_status': prev_status,
+                        'new_status': curr_status
+                    })
+                    
+                    # Si cambió a cancelada, agregar a lista de canceladas
+                    if curr_status == 'cancelada':
+                        changes['cancelled_orders'].append(curr_order['id'])
         
-        # Detectar vehículos removidos (status cambió de 1 a 0 o fue eliminado)
+        # Detectar órdenes que ya no existen en el sistema
+        deleted_order_ids = prev_order_ids - curr_order_ids
+        changes['cancelled_orders'].extend(list(deleted_order_ids))
+        
+        # Detectar vehículos removidos
         removed_vehicle_ids = prev_vehicle_ids - curr_vehicle_ids
         changes['removed_vehicles'] = list(removed_vehicle_ids)
         
@@ -165,18 +179,58 @@ class SyncService:
         
         return changes
     
+    def _normalize_status(self, status) -> str:
+        """
+        Normaliza el estado de la orden a un formato estándar.
+        
+        Mapeo desde Spring Boot:
+        - '1' o 'pendiente' -> 'pendiente'
+        - '2' o 'recogido' -> 'recogido'
+        - '3' o 'completo' -> 'completo'
+        - '4' o 'cancelada' -> 'cancelada'
+        - '5' o 'pospuesta' -> 'pospuesta'
+        """
+        status_str = str(status).lower().strip()
+        
+        if status_str in ['1', 'pendiente']:
+            return 'pendiente'
+        elif status_str in ['2', 'recogido']:
+            return 'recogido'
+        elif status_str in ['3', 'completo', 'completada']:
+            return 'completo'
+        elif status_str in ['4', 'cancelada']:
+            return 'cancelada'
+        elif status_str in ['5', 'pospuesta']:
+            return 'pospuesta'
+        else:
+            return 'pendiente'  # Por defecto
+    
+    def _is_order_active(self, status) -> bool:
+        """
+        Determina si una orden está activa (pendiente o recogido).
+        
+        Returns:
+            True si la orden está pendiente o recogida
+            False si está completa, cancelada o pospuesta
+        """
+        normalized = self._normalize_status(status)
+        return normalized in ['pendiente', 'recogido']
+    
     def save_snapshot(self, execution: OptimizationExecution, 
                      orders: List[Dict], vehicles: List[Dict]):
         """
         Guarda un snapshot del estado actual en SQLite.
+        Incluye posiciones actuales de vehículos.
         """
-        # Guardar órdenes
+        # Guardar órdenes con su estado normalizado
         for order in orders:
+            normalized_status = self._normalize_status(order.get('status', 'pendiente'))
+            
             OrderSnapshot.objects.create(
                 execution=execution,
                 order_id=order['id'],
                 weight=order.get('weight', 0),
-                status=order.get('status', '0'),
+                status=normalized_status,
                 pickup_lat=order['pickupAddress']['latitude'],
                 pickup_lng=order['pickupAddress']['longitude'],
                 delivery_lat=order['deliveryAddress']['latitude'],
@@ -184,14 +238,18 @@ class SyncService:
                 customer_data=order.get('customer')
             )
         
-        # Guardar vehículos
+        # Guardar vehículos con posición actual
         for vehicle in vehicles:
+            current_pos = vehicle.get('current_position')
+            
             VehicleSnapshot.objects.create(
                 execution=execution,
                 vehicle_id=vehicle['id'],
                 capacity=vehicle.get('capacity', 1000),
                 max_distance=vehicle.get('max_distance', 100),
-                status=vehicle.get('status', 1)
+                status=vehicle.get('status', 1),
+                current_lat=current_pos['lat'] if current_pos else None,
+                current_lng=current_pos['lng'] if current_pos else None
             )
     
     def save_route_assignments(self, execution: OptimizationExecution, routes: List[Dict]):
@@ -214,8 +272,15 @@ class SyncService:
                     # Calcular distancia al siguiente punto
                     distance_to_next = None
                     if idx < len(route['stops']) - 1:
-                        # Esta distancia debería calcularse, pero por simplicidad usamos None
-                        distance_to_next = None
+                        stop1 = stop['location']
+                        stop2 = route['stops'][idx + 1]['location']
+                        
+                        from optimization.service.dqn_environment import haversine_distance
+                        distance_to_next = haversine_distance(
+                            stop1['lat'], stop1['lng'],
+                            stop2['lat'], stop2['lng']
+                        )
+                        cumulative_distance += distance_to_next
                     
                     RouteAssignment.objects.create(
                         execution=execution,
@@ -246,9 +311,9 @@ class SyncService:
             previous_orders, previous_vehicles = self.load_previous_data(last_execution)
             changes = self.detect_changes()
         else:
-            # Primera ejecución, todas las órdenes son nuevas
+            # Primera ejecución, todas las órdenes activas son nuevas
             changes = {
-                'new_orders': [o for o in current_orders if o.get('status') == '1'],
+                'new_orders': [o for o in current_orders if self._is_order_active(o.get('status'))],
                 'cancelled_orders': [],
                 'removed_vehicles': [],
                 'status_changed_orders': [],
@@ -260,15 +325,38 @@ class SyncService:
             'last_execution_date': last_execution.executed_at if last_execution else None,
             'current_orders_count': len(current_orders),
             'current_vehicles_count': len(current_vehicles),
-            'active_orders_count': len([o for o in current_orders if o.get('status') == '1']),
+            'active_orders_count': len([o for o in current_orders if self._is_order_active(o.get('status'))]),
             'active_vehicles_count': len([v for v in current_vehicles if v.get('status') == 1]),
             'changes': changes
         }
     
     def get_active_orders(self) -> List[Dict]:
-        """Retorna solo las órdenes activas (status = '1')"""
-        return [o for o in self.current_orders if o.get('status') == '1']
+        """Retorna solo las órdenes activas (pendiente o recogido)"""
+        return [o for o in self.current_orders if self._is_order_active(o.get('status'))]
     
     def get_active_vehicles(self) -> List[Dict]:
         """Retorna solo los vehículos activos (status = 1)"""
         return [v for v in self.current_vehicles if v.get('status') == 1]
+    
+    def extract_vehicle_positions_from_routes(self, routes: List[Dict], depot: Dict) -> Dict:
+        """
+        Extrae las posiciones actuales de los vehículos desde las rutas.
+        La posición actual es la última parada no-depot de cada ruta.
+        
+        Returns:
+            Dict {vehicle_id: {'lat': ..., 'lng': ...}}
+        """
+        vehicle_positions = {}
+        
+        for route in routes:
+            vehicle_id = route['vehicle_id']
+            last_position = depot.copy()
+            
+            # Encontrar última parada no-depot
+            for stop in route['stops']:
+                if stop['type'] != 'depot':
+                    last_position = stop['location']
+            
+            vehicle_positions[vehicle_id] = last_position
+        
+        return vehicle_positions

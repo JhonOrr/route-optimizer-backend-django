@@ -1,14 +1,11 @@
 from django.db import models
-
-# Create your models here.
-from django.db import models
 from django.utils import timezone
 
 class ACORouteResult(models.Model):
     executed_at = models.DateTimeField(default=timezone.now)
     best_distance = models.FloatField()
-    parameters = models.JSONField()  # Guarda num_ants, iterations, etc.
-    routes = models.JSONField()      # Guarda las rutas generadas
+    parameters = models.JSONField()
+    routes = models.JSONField()
     success = models.BooleanField(default=True)
 
     def __str__(self):
@@ -37,14 +34,11 @@ class OptimizationExecution(models.Model):
     executed_at = models.DateTimeField(default=timezone.now)
     completed_at = models.DateTimeField(null=True, blank=True)
     
-    # Parámetros de ejecución
     parameters = models.JSONField(default=dict)
     
-    # Resultados
     best_distance = models.FloatField(null=True, blank=True)
     routes = models.JSONField(null=True, blank=True)
     
-    # Información adicional
     num_orders_processed = models.IntegerField(default=0)
     num_vehicles_used = models.IntegerField(default=0)
     error_message = models.TextField(null=True, blank=True)
@@ -59,24 +53,21 @@ class OptimizationExecution(models.Model):
 class OrderSnapshot(models.Model):
     """
     Snapshot de una orden en un momento dado
+    ESTADOS: pendiente, recogido, completada, cancelada
     """
     execution = models.ForeignKey(OptimizationExecution, on_delete=models.CASCADE, related_name='orders')
     
-    # Datos de la orden desde Spring Boot
     order_id = models.IntegerField()
     weight = models.FloatField()
-    status = models.CharField(max_length=10)
+    status = models.CharField(max_length=20)  # pendiente, recogido, completada, cancelada
     
-    # Direcciones
     pickup_lat = models.FloatField()
     pickup_lng = models.FloatField()
     delivery_lat = models.FloatField()
     delivery_lng = models.FloatField()
     
-    # Cliente
     customer_data = models.JSONField(null=True, blank=True)
     
-    # Timestamps
     created_at = models.DateTimeField(default=timezone.now)
     
     class Meta:
@@ -85,22 +76,25 @@ class OrderSnapshot(models.Model):
         ]
         
     def __str__(self):
-        return f"Order {self.order_id} - Execution {self.execution_id}"
+        return f"Order {self.order_id} - {self.status} - Execution {self.execution_id}"
 
 
 class VehicleSnapshot(models.Model):
     """
     Snapshot de un vehículo en un momento dado
+    Incluye posición actual (última dirección visitada)
     """
     execution = models.ForeignKey(OptimizationExecution, on_delete=models.CASCADE, related_name='vehicles')
     
-    # Datos del vehículo desde Spring Boot
     vehicle_id = models.IntegerField()
     capacity = models.FloatField()
     max_distance = models.FloatField(default=100.0)
     status = models.IntegerField()
     
-    # Timestamps
+    # Posición actual del vehículo (última dirección visitada)
+    current_lat = models.FloatField(null=True, blank=True)
+    current_lng = models.FloatField(null=True, blank=True)
+    
     created_at = models.DateTimeField(default=timezone.now)
     
     class Meta:
@@ -121,11 +115,9 @@ class RouteAssignment(models.Model):
     order_id = models.IntegerField()
     vehicle_id = models.IntegerField()
     
-    # Información de la ruta
-    stop_sequence = models.IntegerField()  # Posición en la secuencia de paradas
+    stop_sequence = models.IntegerField()
     stop_type = models.CharField(max_length=10)  # 'pickup' o 'delivery'
     
-    # Métricas
     distance_to_next = models.FloatField(null=True, blank=True)
     cumulative_distance = models.FloatField(null=True, blank=True)
     cumulative_load = models.FloatField(null=True, blank=True)
@@ -155,16 +147,13 @@ class DQNState(models.Model):
         related_name='dqn_state'
     )
     
-    # Estado del modelo
     model_path = models.CharField(max_length=255, default='models/dqn_vrp_model.pth')
     epsilon = models.FloatField(default=1.0)
     
-    # Estadísticas de entrenamiento
     total_episodes = models.IntegerField(default=0)
     total_operations = models.IntegerField(default=0)
     avg_reward = models.FloatField(null=True, blank=True)
     
-    # Timestamps
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
     
@@ -177,13 +166,14 @@ class DQNState(models.Model):
 
 class OperationLog(models.Model):
     """
-    Log de operaciones dinámicas (añadir orden, cancelar, remover vehículo)
+    Log de operaciones dinámicas
     """
     OPERATION_CHOICES = [
         ('add_order', 'Añadir Orden'),
         ('cancel_order', 'Cancelar Orden'),
         ('remove_vehicle', 'Remover Vehículo'),
         ('batch_add', 'Añadir Batch de Órdenes'),
+        ('status_change', 'Cambio de Estado'),
     ]
     
     execution = models.ForeignKey(
@@ -194,16 +184,13 @@ class OperationLog(models.Model):
     
     operation_type = models.CharField(max_length=20, choices=OPERATION_CHOICES)
     
-    # Datos de la operación
     order_id = models.IntegerField(null=True, blank=True)
     vehicle_id = models.IntegerField(null=True, blank=True)
     
-    # Resultado
     success = models.BooleanField(default=False)
     assigned = models.BooleanField(default=False)
     reward = models.FloatField(null=True, blank=True)
     
-    # Detalles adicionales
     details = models.JSONField(null=True, blank=True)
     
     created_at = models.DateTimeField(default=timezone.now)
