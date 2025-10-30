@@ -1,13 +1,13 @@
 [
   {
     "type": "add_order",
-    "order_id": 16,
+    "order_id": 20,
     "order_status": "pendiente",
     "assigned": false,
     "vehicle_id": null,
     "reward": -5.0,
     "loss": null,
-    "epsilon": 0.995,
+    "epsilon": 0.9752487531218751,
     "pending_stops": 2
   },
   {
@@ -18,57 +18,20 @@
     "successful_assignments": 0,
     "pending_orders": 1,
     "pending_order_ids": [
-      16
+      20
     ],
     "skipped_order_details": [],
     "assignment_rate": 0.0,
     "details": [
       {
         "type": "add_order",
-        "order_id": 16,
+        "order_id": 20,
         "order_status": "pendiente",
         "assigned": false,
         "vehicle_id": null,
         "reward": -5.0,
         "loss": null,
-        "epsilon": 0.995,
-        "pending_stops": 2
-      }
-    ]
-  },
-  {
-    "type": "add_order",
-    "order_id": 17,
-    "order_status": "pendiente",
-    "assigned": false,
-    "vehicle_id": null,
-    "reward": -5.0,
-    "loss": null,
-    "epsilon": 0.990025,
-    "pending_stops": 2
-  },
-  {
-    "type": "batch_add_orders",
-    "total_orders": 1,
-    "processed_orders": 1,
-    "skipped_orders": 0,
-    "successful_assignments": 0,
-    "pending_orders": 1,
-    "pending_order_ids": [
-      17
-    ],
-    "skipped_order_details": [],
-    "assignment_rate": 0.0,
-    "details": [
-      {
-        "type": "add_order",
-        "order_id": 17,
-        "order_status": "pendiente",
-        "assigned": false,
-        "vehicle_id": null,
-        "reward": -5.0,
-        "loss": null,
-        "epsilon": 0.990025,
+        "epsilon": 0.9752487531218751,
         "pending_stops": 2
       }
     ]

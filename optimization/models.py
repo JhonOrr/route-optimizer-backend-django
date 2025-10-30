@@ -203,3 +203,24 @@ class OperationLog(models.Model):
         
     def __str__(self):
         return f"{self.operation_type} - {self.created_at}"
+    
+    
+class LastACORoute(models.Model):
+    """
+    Almacena la última ruta ejecutada por el algoritmo ACO.
+    Solo se mantiene una ruta a la vez (la más reciente).
+    """
+    executed_at = models.DateTimeField(default=timezone.now)
+    best_distance = models.FloatField()
+    parameters = models.JSONField()  # Almacena los parámetros del algoritmo
+    routes = models.JSONField()  # Almacena las rutas completas
+    num_orders_processed = models.IntegerField()
+    num_vehicles_used = models.IntegerField()
+    
+    class Meta:
+        ordering = ['-executed_at']
+        verbose_name = 'Last ACO Route'
+        verbose_name_plural = 'Last ACO Routes'
+    
+    def __str__(self):
+        return f"ACO Route - {self.executed_at.strftime('%Y-%m-%d %H:%M:%S')}"
